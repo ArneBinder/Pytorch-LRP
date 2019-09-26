@@ -381,7 +381,8 @@ class RelevancePropagator:
             del sum_weights, input_relevance, norm, rare_neurons, \
                 mask, new_norm, m.in_tensor, w, inv_w
 
-            return relevance_out.reshape(shape_in)
+            #return relevance_out.reshape(shape_in)
+            return relevance_out
 
     @module_tracker
     def linear_fwd_hook(self, m, in_tensor: torch.Tensor,
