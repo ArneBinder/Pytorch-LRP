@@ -1,7 +1,15 @@
 import torch
 import numpy as np
 import torch.nn.functional as F
-from utils import pprint, Flatten
+import allennlp
+
+
+class Flatten(torch.nn.Module):
+    def __init__(self):
+        super(Flatten, self).__init__()
+
+    def forward(self, in_tensor):
+        return in_tensor.view((in_tensor.size()[0], -1))
 
 
 def module_tracker(fwd_hook_func):
@@ -104,7 +112,7 @@ class RelevancePropagator:
                 relevance[relevance == 0] = -1e6
                 relevance = relevance.exp()
                 if not self.warned_log_softmax:
-                    pprint("WARNING: LogSoftmax layer was "
+                    print("WARNING: LogSoftmax layer was "
                            "turned into probabilities.")
                     self.warned_log_softmax = True
             return relevance
@@ -117,6 +125,10 @@ class RelevancePropagator:
 
         elif isinstance(layer, torch.nn.Linear):
             return self.linear_inverse(layer, relevance).detach()
+        elif isinstance(layer, allennlp.modules.seq2seq_encoders.PassThroughEncoder):
+            return self.mask_inverse(layer, relevance).detach()
+        elif isinstance(layer, allennlp.modules.TimeDistributed):
+            return self.time_distributed_inverse(layer, relevance).detach()
         else:
             raise NotImplementedError("The network contains layers that"        
                                       " are currently not supported {0:s}".format(str(layer)))
@@ -150,6 +162,12 @@ class RelevancePropagator:
 
         if isinstance(layer, torch.nn.Linear):
             return self.linear_fwd_hook
+
+        if isinstance(layer, allennlp.modules.seq2seq_encoders.PassThroughEncoder):
+            return self.mask_fwd_hook
+
+        if isinstance(layer, allennlp.modules.TimeDistributed):
+            return self.time_distributed_fwd_hook
 
         else:
             raise NotImplementedError("The network contains layers that"
@@ -234,8 +252,31 @@ class RelevancePropagator:
         }
         return conv_func_mapper[type(max_pool_instance)]
 
+    def time_distributed_inverse(self, m, relevance_in):
+        # TODO: check that!
+        _shape = list(relevance_in.shape)
+        return relevance_in.reshape([_shape[0] * _shape[1]] + _shape[2:])
+
+    def mask_inverse(self, m, relevance_in):
+        try:
+            # executes only if m has a mask attribute
+            mask = m.mask
+        except AttributeError as e:
+            return relevance_in
+
+        # m.in_tensor = m.in_tensor
+        # m.weight = m.mask.reshape(-1).unsqueeze(-1).expand(-1, m.get_input_dim())
+        mask = mask.reshape(-1).unsqueeze(-1).expand(-1, m.get_input_dim())
+        # m.weight = m.mask.reshape(-1).unsqueeze(-1).t()
+        m.weight = torch.eye(m.get_input_dim()) * mask
+        rel = self.linear_inverse(m, relevance_in)
+        return rel.detach()
+
     def linear_inverse(self, m, relevance_in):
 
+        #shape_in = m.in_tensor.shape
+        #m.in_tensor = m.in_tensor.reshape([-1, m.in_tensor.shape[-1]])
+        #relevance_in = relevance_in.reshape([-1, relevance_in.shape[-1]])
         if self.method == "e-rule":
             m.in_tensor = m.in_tensor.pow(self.p)
             w = m.weight.pow(self.p)
@@ -248,6 +289,7 @@ class RelevancePropagator:
                                      w.t(), bias=None)
             relevance_out *= m.in_tensor
             del m.in_tensor, norm, w, relevance_in
+            #return relevance_out.reshape(shape_in)
             return relevance_out
 
         if self.method == "b-rule":
@@ -339,7 +381,7 @@ class RelevancePropagator:
             del sum_weights, input_relevance, norm, rare_neurons, \
                 mask, new_norm, m.in_tensor, w, inv_w
 
-            return relevance_out
+            return relevance_out.reshape(shape_in)
 
     @module_tracker
     def linear_fwd_hook(self, m, in_tensor: torch.Tensor,
@@ -347,6 +389,26 @@ class RelevancePropagator:
 
         setattr(m, "in_tensor", in_tensor[0])
         setattr(m, "out_shape", list(out_tensor.size()))
+        return
+
+    @module_tracker
+    def mask_fwd_hook(self, m, in_tensor: torch.Tensor, out_tensor: torch.Tensor):
+
+        assert isinstance(in_tensor, tuple), f'expected in_tensor to be a tuple, but it is {type(in_tensor)}'
+        if len(in_tensor) > 1:
+            setattr(m, "in_tensor", in_tensor[0])
+            #weight_mask = in_tensor[1].float().reshape(-1)
+            #weight_mask = weight_mask.T
+            setattr(m, "mask", in_tensor[1].float()) #, dtype=float))
+            # TODO: check that! relevant for b-rule (linear_inverse)
+            setattr(m, "out_shape", out_tensor.shape)
+        return
+
+    @module_tracker
+    def time_distributed_fwd_hook(self, m, in_tensor: torch.Tensor, out_tensor: torch.Tensor):
+        #assert isinstance(in_tensor, tuple), f'expected in_tensor to be a tuple, but it is a {type(in_tensor)}'
+        #assert len(in_tensor) == 1, f'expected in_tensor to be a tuple of size 1, but it has size {len(in_tensor)}'
+        #setattr(m, "in_shape", in_tensor[0].shape)
         return
 
     def max_pool_nd_inverse(self, layer_instance, relevance_in):

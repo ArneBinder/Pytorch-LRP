@@ -1,8 +1,22 @@
+import allennlp
 import torch
-import numpy as np
 
-from inverter_util import RelevancePropagator
-from utils import pprint, Flatten
+from pytorch_lrp.inverter_util import RelevancePropagator
+
+
+def fullname(o):
+    # o.__module__ + "." + o.__class__.__qualname__ is an example in
+    # this context of H.L. Mencken's "neat, plausible, and wrong."
+    # Python makes no guarantees as to whether the __module__ special
+    # attribute is defined, so we take a more circumspect approach.
+    # Alas, the module name is explicitly excluded from __qualname__
+    # in Python 3.
+
+    module = o.__class__.__module__
+    if module is None or module == str.__class__.__module__:
+        return o.__class__.__qualname__  # Avoid reporting __builtin__
+    else:
+        return module + '.' + o.__class__.__qualname__
 
 
 class InnvestigateModel(torch.nn.Module):
@@ -15,7 +29,7 @@ class InnvestigateModel(torch.nn.Module):
     """
 
     def __init__(self, the_model, lrp_exponent=1, beta=.5, epsilon=1e-6,
-                 method="e-rule"):
+                 method="e-rule", discard_modules=None):
         """
         Model wrapper for pytorch models to 'innvestigate' them
         with layer-wise relevance propagation (LRP) as introduced by Bach et. al
@@ -47,6 +61,7 @@ class InnvestigateModel(torch.nn.Module):
         self.prediction = None
         self.r_values_per_layer = None
         self.only_max_score = None
+        self.discard_modules = discard_modules or []
         # Initialize the 'Relevance Propagator' with the chosen rule.
         # This will be used to back-propagate the relevance values
         # through the layers in the innvestigate method.
@@ -76,7 +91,7 @@ class InnvestigateModel(torch.nn.Module):
         self.inverter.device = self.device
         return super(InnvestigateModel, self).cpu()
 
-    def register_hooks(self, parent_module):
+    def register_hooks(self, parent_module, name_prefix=None):
         """
         Recursively unrolls a model and registers the required
         hooks to save all the necessary values for LRP in the forward pass.
@@ -88,16 +103,24 @@ class InnvestigateModel(torch.nn.Module):
             None
 
         """
-        for mod in parent_module.children():
-            if list(mod.children()):
-                self.register_hooks(mod)
+        for name, mod in parent_module.named_children():
+            name_w_prefix = f'{name_prefix}.{name}' if name_prefix is not None else name
+            if name_w_prefix in self.discard_modules:
+                print(f'add_rlp_forward_hook@{name_w_prefix} ({fullname(mod)}): DISCARD')
                 continue
-            mod.register_forward_hook(
-                self.inverter.get_layer_fwd_hook(mod))
+            print(f'add_rlp_forward_hook@{name_w_prefix} ({fullname(mod)})')
+            if list(mod.children()):
+                self.register_hooks(mod, name_prefix=name_w_prefix)
+                #continue
+            #try:
+
+            mod.register_forward_hook(self.inverter.get_layer_fwd_hook(mod))
             if isinstance(mod, torch.nn.ReLU):
-                mod.register_backward_hook(
-                    self.relu_hook_function
-                )
+                mod.register_backward_hook(self.relu_hook_function)
+            elif isinstance(mod, allennlp.modules.TimeDistributed):
+                mod.register_backward_hook(self.timedistributed_hook_function)
+            #except NotImplementedError as e:
+            #    print(f'WARNING: {name_w_prefix}: {e}')
 
     @staticmethod
     def relu_hook_function(module, grad_in, grad_out):
@@ -105,6 +128,15 @@ class InnvestigateModel(torch.nn.Module):
         If there is a negative gradient, change it to zero.
         """
         return (torch.clamp(grad_in[0], min=0.0),)
+
+    @staticmethod
+    def timedistributed_hook_function(module, grad_in, grad_out):
+        """
+        If there is a negative gradient, change it to zero.
+        """
+        raise NotImplementedError
+        #return (torch.clamp(grad_in[0], min=0.0),)
+        return grad_in
 
     def __call__(self, in_tensor):
         """
@@ -120,7 +152,7 @@ class InnvestigateModel(torch.nn.Module):
         """
         return self.evaluate(in_tensor)
 
-    def evaluate(self, in_tensor):
+    def evaluate(self, *args, **kwargs):
         """
         Evaluates the model on a new input. The registered forward hooks will
         save all the data that is necessary to compute the relevance per neuron per layer.
@@ -134,16 +166,16 @@ class InnvestigateModel(torch.nn.Module):
         # Reset module list. In case the structure changes dynamically,
         # the module list is tracked for every forward pass.
         self.inverter.reset_module_list()
-        self.prediction = self.model(in_tensor)
+        self.prediction = self.model(*args, **kwargs)
         return self.prediction
 
     def get_r_values_per_layer(self):
         if self.r_values_per_layer is None:
-            pprint("No relevances have been calculated yet, returning None in"
+            print("No relevances have been calculated yet, returning None in"
                    " get_r_values_per_layer.")
         return self.r_values_per_layer
 
-    def innvestigate(self, in_tensor=None, rel_for_class=None):
+    def innvestigate(self, in_tensor=None, prediction=None, relevance_tensor=None, rel_for_class=None):
         """
         Method for 'innvestigating' the model with the LRP rule chosen at
         the initialization of the InnvestigateModel.
@@ -152,6 +184,8 @@ class InnvestigateModel(torch.nn.Module):
                         If input is None, the last evaluation is used.
                         If no evaluation has been performed since initialization,
                         an error is raised.
+            prediction: predicted output to use for backward pass
+            relevance_tensor: relevance tensor for last layer
             rel_for_class (int): Index of the class for which the relevance
                         distribution is to be analyzed. If None, the 'winning' class
                         is used for indexing.
@@ -168,7 +202,7 @@ class InnvestigateModel(torch.nn.Module):
 
         with torch.no_grad():
             # Check if innvestigation can be performed.
-            if in_tensor is None and self.prediction is None:
+            if in_tensor is None and prediction is None and self.prediction is None:
                 raise RuntimeError("Model needs to be evaluated at least "
                                    "once before an innvestigation can be "
                                    "performed. Please evaluate model first "
@@ -179,27 +213,32 @@ class InnvestigateModel(torch.nn.Module):
             if in_tensor is not None:
                 self.evaluate(in_tensor)
 
-            # If no class index is specified, analyze for class
-            # with highest prediction.
-            if rel_for_class is None:
-                # Default behaviour is innvestigating the output
-                # on an arg-max-basis, if no class is specified.
-                org_shape = self.prediction.size()
-                # Make sure shape is just a 1D vector per batch example.
-                self.prediction = self.prediction.view(org_shape[0], -1)
-                max_v, _ = torch.max(self.prediction, dim=1, keepdim=True)
-                only_max_score = torch.zeros_like(self.prediction).to(self.device)
-                only_max_score[max_v == self.prediction] = self.prediction[max_v == self.prediction]
-                relevance_tensor = only_max_score.view(org_shape)
-                self.prediction.view(org_shape)
+            if prediction is None:
+                prediction = self.prediction
 
-            else:
-                org_shape = self.prediction.size()
-                self.prediction = self.prediction.view(org_shape[0], -1)
-                only_max_score = torch.zeros_like(self.prediction).to(self.device)
-                only_max_score[:, rel_for_class] += self.prediction[:, rel_for_class]
-                relevance_tensor = only_max_score.view(org_shape)
-                self.prediction.view(org_shape)
+            if relevance_tensor is None:
+                # If no class index is specified, analyze for class
+                # with highest prediction.
+                if rel_for_class is None:
+                    # Default behaviour is innvestigating the output
+                    # on an arg-max-basis, if no class is specified.
+                    org_shape = prediction.size()
+                    # Make sure shape is just a 1D vector per batch example.
+                    # TODO: is flatten instead correct?
+                    prediction = prediction.view(-1, org_shape[-1])
+                    max_v, _ = torch.max(prediction, dim=1, keepdim=True)
+                    only_max_score = torch.zeros_like(prediction).to(self.device)
+                    only_max_score[max_v == prediction] = prediction[max_v == prediction]
+                    relevance_tensor = only_max_score.view(org_shape)
+                    prediction = prediction.view(org_shape)
+
+                else:
+                    org_shape = prediction.size()
+                    prediction = prediction.view(org_shape[0], -1)
+                    only_max_score = torch.zeros_like(prediction).to(self.device)
+                    only_max_score[:, rel_for_class] += prediction[:, rel_for_class]
+                    relevance_tensor = only_max_score.view(org_shape)
+                    prediction = prediction.view(org_shape)
 
             # We have to iterate through the model backwards.
             # The module list is computed for every forward pass
@@ -219,7 +258,7 @@ class InnvestigateModel(torch.nn.Module):
             del relevance
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
-            return self.prediction, r_values_per_layer[-1]
+            return prediction, r_values_per_layer[-1]
 
     def forward(self, in_tensor):
         return self.model.forward(in_tensor)
