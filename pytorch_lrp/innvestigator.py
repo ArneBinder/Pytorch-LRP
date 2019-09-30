@@ -251,14 +251,14 @@ class InnvestigateModel(torch.nn.Module):
             for layer in rev_model:
                 # Compute layer specific backwards-propagation of relevance values
                 relevance = self.inverter.compute_propagated_relevance(layer, relevance)
-                r_values_per_layer.append(relevance.cpu())
+                r_values_per_layer.append(relevance)
 
             self.r_values_per_layer = r_values_per_layer
 
             del relevance
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
-            return prediction, r_values_per_layer[-1].to(device=self.device.type)
+            return prediction, r_values_per_layer[-1]#.to(device=self.device.type)
 
     def forward(self, in_tensor):
         return self.model.forward(in_tensor)
