@@ -24,7 +24,8 @@ def module_tracker(fwd_hook_func):
 
     """
     def hook_wrapper(relevance_propagator_instance, layer, *args):
-        relevance_propagator_instance.module_list.append(layer)
+        #relevance_propagator_instance.module_list.append(layer)
+        relevance_propagator_instance.module_dict[layer.name_global] = layer
         return fwd_hook_func(relevance_propagator_instance, layer, *args)
 
     return hook_wrapper
@@ -48,7 +49,8 @@ class RelevancePropagator:
                            torch.nn.Dropout3d,
                            torch.nn.Softmax,
                            torch.nn.LogSoftmax,
-                           torch.nn.Sigmoid)
+                           torch.nn.Sigmoid,
+                           allennlp.modules.seq2seq_encoders.PassThroughEncoder)
     # Implemented rules for relevance propagation.
     available_methods = ["e-rule", "b-rule"]
 
@@ -60,7 +62,8 @@ class RelevancePropagator:
         self.beta = beta
         self.eps = epsilon
         self.warned_log_softmax = False
-        self.module_list = []
+        self.module_dict = {}
+        self.relevances = {}
         if method not in self.available_methods:
             raise NotImplementedError("Only methods available are: " +
                                       str(self.available_methods))
@@ -75,12 +78,25 @@ class RelevancePropagator:
             None
 
         """
-        self.module_list = []
+        #self.module_list = []
+        self.module_dict = {}
         # Try to free memory
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
 
-    def compute_propagated_relevance(self, layer, relevance):
+    def get_relevance(self, module_name, relevance_in):
+        if module_name not in self.relevances:
+            m = self.module_dict[module_name]
+            self.relevances[module_name] = self.compute_propagated_relevance(layer=m, relevance_in=relevance_in)
+        return self.relevances[module_name]
+
+    def set_relevances(self, init_dict):
+        self.relevances = init_dict
+
+    def reset_relevances(self):
+        self.relevances = {}
+
+    def compute_propagated_relevance(self, layer, relevance_in):
         """
         This method computes the backward pass for the incoming relevance
         for the specified layer.
@@ -96,11 +112,11 @@ class RelevancePropagator:
 
         if isinstance(layer,
                       (torch.nn.MaxPool1d, torch.nn.MaxPool2d, torch.nn.MaxPool3d)):
-            return self.max_pool_nd_inverse(layer, relevance).detach()
+            return self.max_pool_nd_inverse(layer, relevance_in).detach()
 
         elif isinstance(layer,
                       (torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d)):
-            return self.conv_nd_inverse(layer, relevance).detach()
+            return self.conv_nd_inverse(layer, relevance_in).detach()
 
         elif isinstance(layer, torch.nn.LogSoftmax):
             # Only layer that does not conserve relevance. Mainly used
@@ -108,27 +124,29 @@ class RelevancePropagator:
             # be changed to pure passing and the user should make sure
             # the layer outputs are sensible (0 would be 100% class probability,
             # but no relevance could be passed on).
-            if relevance.sum() < 0:
-                relevance[relevance == 0] = -1e6
-                relevance = relevance.exp()
+            if relevance_in.sum() < 0:
+                relevance_in[relevance_in == 0] = -1e6
+                relevance_in = relevance_in.exp()
                 if not self.warned_log_softmax:
                     print("WARNING: LogSoftmax layer was "
                            "turned into probabilities.")
                     self.warned_log_softmax = True
-            return relevance
+            return relevance_in
         elif isinstance(layer, self.allowed_pass_layers):
             # The above layers are one-to-one mappings of input to
             # output nodes. All the relevance in the output will come
             # entirely from the input node. Given the conservation
             # of relevance, the input is as relevant as the output.
-            return relevance
+            return relevance_in
 
         elif isinstance(layer, torch.nn.Linear):
-            return self.linear_inverse(layer, relevance).detach()
-        elif isinstance(layer, allennlp.modules.seq2seq_encoders.PassThroughEncoder):
-            return self.mask_inverse(layer, relevance).detach()
+            return self.linear_inverse(layer, relevance_in).detach()
+        #elif isinstance(layer, allennlp.modules.seq2seq_encoders.PassThroughEncoder):
+        #    return self.mask_inverse(layer, relevance_in).detach()
         elif isinstance(layer, allennlp.modules.TimeDistributed):
-            return self.time_distributed_inverse(layer, relevance).detach()
+            return self.time_distributed_inverse(layer, relevance_in).detach()
+        elif isinstance(layer, allennlp.models.crf_tagger.CrfTagger):
+            return self.crf_tagger_inverse(layer, relevance_in).detach()
         else:
             raise NotImplementedError("The network contains layers that"        
                                       " are currently not supported {0:s}".format(str(layer)))
@@ -163,11 +181,14 @@ class RelevancePropagator:
         if isinstance(layer, torch.nn.Linear):
             return self.linear_fwd_hook
 
-        if isinstance(layer, allennlp.modules.seq2seq_encoders.PassThroughEncoder):
-            return self.mask_fwd_hook
+        #if isinstance(layer, allennlp.modules.seq2seq_encoders.PassThroughEncoder):
+        #    return self.mask_fwd_hook
 
         if isinstance(layer, allennlp.modules.TimeDistributed):
             return self.time_distributed_fwd_hook
+
+        if isinstance(layer, allennlp.models.crf_tagger.CrfTagger):
+            return self.crf_tagger_fwd_hook
 
         else:
             raise NotImplementedError("The network contains layers that"
@@ -253,9 +274,16 @@ class RelevancePropagator:
         return conv_func_mapper[type(max_pool_instance)]
 
     def time_distributed_inverse(self, m, relevance_in):
-        # TODO: check that!
-        _shape = list(relevance_in.shape)
-        return relevance_in.reshape([_shape[0] * _shape[1]] + _shape[2:])
+        shape_in = list(relevance_in.shape)
+        relevance_in_reshaped = relevance_in.reshape([shape_in[0] * shape_in[1]] + shape_in[2:])
+        r = self.get_relevance(f'{m.name_global}._module', relevance_in_reshaped)
+        shape_out = [shape_in[0], shape_in[1]] + list(r.shape)[1:]
+        return r.reshape(shape_out)
+
+    def crf_tagger_inverse(self, m, relevance_in):
+        # TODO: implement missing cases (currently we assume that relevance_in is just for logits)
+        r = self.get_relevance(f'{m.name_global}.tag_projection_layer', relevance_in['logits'])
+        return r
 
     def mask_inverse(self, m, relevance_in):
         try:
@@ -410,6 +438,11 @@ class RelevancePropagator:
         #assert isinstance(in_tensor, tuple), f'expected in_tensor to be a tuple, but it is a {type(in_tensor)}'
         #assert len(in_tensor) == 1, f'expected in_tensor to be a tuple of size 1, but it has size {len(in_tensor)}'
         #setattr(m, "in_shape", in_tensor[0].shape)
+        return
+
+    @module_tracker
+    def crf_tagger_fwd_hook(self, m, in_tensor: torch.Tensor, out_tensor: torch.Tensor):
+
         return
 
     def max_pool_nd_inverse(self, layer_instance, relevance_in):

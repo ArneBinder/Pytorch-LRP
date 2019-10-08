@@ -91,7 +91,7 @@ class InnvestigateModel(torch.nn.Module):
         self.inverter.device = self.device
         return super(InnvestigateModel, self).cpu()
 
-    def register_hooks(self, parent_module, name_prefix=None):
+    def register_hooks(self, parent_module, name_prefix='model'):
         """
         Recursively unrolls a model and registers the required
         hooks to save all the necessary values for LRP in the forward pass.
@@ -103,24 +103,34 @@ class InnvestigateModel(torch.nn.Module):
             None
 
         """
+        print(f'add_rlp_forward_hook@{name_prefix} ({fullname(parent_module)})')
+        parent_module.register_forward_hook(self.inverter.get_layer_fwd_hook(parent_module))
+
+        if name_prefix == 'model':
+            setattr(parent_module, "name_local", 'model')
+            setattr(parent_module, "name_global", 'model')
+
+        if isinstance(parent_module, torch.nn.ReLU):
+            parent_module.register_backward_hook(self.relu_hook_function)
+
+        #children_name_global = []
         for name, mod in parent_module.named_children():
             name_w_prefix = f'{name_prefix}.{name}' if name_prefix is not None else name
             if name_w_prefix in self.discard_modules:
                 print(f'add_rlp_forward_hook@{name_w_prefix} ({fullname(mod)}): DISCARD')
                 continue
-            print(f'add_rlp_forward_hook@{name_w_prefix} ({fullname(mod)})')
-            if list(mod.children()):
-                self.register_hooks(mod, name_prefix=name_w_prefix)
-                #continue
-            #try:
+            #if not isinstance(mod, self.inverter.allowed_pass_layers):
+            #    children_name_global.append(name_w_prefix)
+            setattr(mod, "name_local", name)
+            setattr(mod, "name_global", name_w_prefix)
+            try:
+                parent_name = parent_module.name_global
+                setattr(mod, "name_parent", parent_name)
+            except AttributeError:
+                pass
+            self.register_hooks(mod, name_prefix=name_w_prefix)
 
-            mod.register_forward_hook(self.inverter.get_layer_fwd_hook(mod))
-            if isinstance(mod, torch.nn.ReLU):
-                mod.register_backward_hook(self.relu_hook_function)
-            elif isinstance(mod, allennlp.modules.TimeDistributed):
-                mod.register_backward_hook(self.timedistributed_hook_function)
-            #except NotImplementedError as e:
-            #    print(f'WARNING: {name_w_prefix}: {e}')
+        #setattr(parent_module, "name_children", children_name_global)
 
     @staticmethod
     def relu_hook_function(module, grad_in, grad_out):
@@ -128,15 +138,6 @@ class InnvestigateModel(torch.nn.Module):
         If there is a negative gradient, change it to zero.
         """
         return (torch.clamp(grad_in[0], min=0.0),)
-
-    @staticmethod
-    def timedistributed_hook_function(module, grad_in, grad_out):
-        """
-        If there is a negative gradient, change it to zero.
-        """
-        raise NotImplementedError
-        #return (torch.clamp(grad_in[0], min=0.0),)
-        return grad_in
 
     def __call__(self, in_tensor):
         """
@@ -175,7 +176,7 @@ class InnvestigateModel(torch.nn.Module):
                    " get_r_values_per_layer.")
         return self.r_values_per_layer
 
-    def innvestigate(self, in_tensor=None, prediction=None, relevance_tensor=None, rel_for_class=None):
+    def innvestigate(self, in_tensor=None, prediction=None, relevance=None, rel_for_class=None):
         """
         Method for 'innvestigating' the model with the LRP rule chosen at
         the initialization of the InnvestigateModel.
@@ -195,10 +196,6 @@ class InnvestigateModel(torch.nn.Module):
             In order to get relevance distributions in other layers, use
             the get_r_values_per_layer method.
         """
-        if self.r_values_per_layer is not None:
-            for elt in self.r_values_per_layer:
-                del elt
-            self.r_values_per_layer = None
 
         with torch.no_grad():
             # Check if innvestigation can be performed.
@@ -216,7 +213,7 @@ class InnvestigateModel(torch.nn.Module):
             if prediction is None:
                 prediction = self.prediction
 
-            if relevance_tensor is None:
+            if relevance is None:
                 # If no class index is specified, analyze for class
                 # with highest prediction.
                 if rel_for_class is None:
@@ -240,25 +237,15 @@ class InnvestigateModel(torch.nn.Module):
                     relevance_tensor = only_max_score.view(org_shape)
                     prediction = prediction.view(org_shape)
 
-            # We have to iterate through the model backwards.
-            # The module list is computed for every forward pass
-            # by the model inverter.
-            rev_model = self.inverter.module_list[::-1]
-            relevance = relevance_tensor.detach()
-            del relevance_tensor
-            # List to save relevance distributions per layer
-            r_values_per_layer = [relevance]
-            for layer in rev_model:
-                # Compute layer specific backwards-propagation of relevance values
-                relevance = self.inverter.compute_propagated_relevance(layer, relevance)
-                r_values_per_layer.append(relevance)
+                relevance = relevance_tensor.detach()
+                del relevance_tensor
+            # reset list to save relevance distributions per layer
+            self.inverter.reset_relevances()
+            r = self.inverter.get_relevance(module_name='model', relevance_in=relevance)
 
-            self.r_values_per_layer = r_values_per_layer
-
-            del relevance
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
-            return prediction, r_values_per_layer[-1]#.to(device=self.device.type)
+            return prediction, r
 
     def forward(self, in_tensor):
         return self.model.forward(in_tensor)
