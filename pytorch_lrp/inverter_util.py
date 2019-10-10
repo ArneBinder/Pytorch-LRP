@@ -3,6 +3,8 @@ import numpy as np
 import torch.nn.functional as F
 import allennlp
 
+from pytorch_lrp.explainable_modules.cnn_encoder import ExplainableCnnEncoder, MaxPool1dAll
+
 
 class Flatten(torch.nn.Module):
     def __init__(self):
@@ -147,6 +149,10 @@ class RelevancePropagator:
             return self.time_distributed_inverse(layer, relevance_in).detach()
         elif isinstance(layer, allennlp.models.crf_tagger.CrfTagger):
             return self.crf_tagger_inverse(layer, relevance_in).detach()
+        elif isinstance(layer, ExplainableCnnEncoder):
+            return self.cnn_encoder_inverse(layer, relevance_in).detach()
+        elif isinstance(layer, allennlp.models.BasicClassifier):
+            return self.basic_classifier_inverse(layer, relevance_in).detach()
         else:
             raise NotImplementedError("The network contains layers that"        
                                       " are currently not supported {0:s}".format(str(layer)))
@@ -185,14 +191,19 @@ class RelevancePropagator:
         #    return self.mask_fwd_hook
 
         if isinstance(layer, allennlp.modules.TimeDistributed):
-            return self.time_distributed_fwd_hook
+            return self.silent_pass
 
         if isinstance(layer, allennlp.models.crf_tagger.CrfTagger):
-            return self.crf_tagger_fwd_hook
+            return self.silent_pass
 
-        else:
-            raise NotImplementedError("The network contains layers that"
-                                      " are currently not supported {0:s}".format(str(layer)))
+        if isinstance(layer, ExplainableCnnEncoder):
+            return self.silent_pass
+
+        if isinstance(layer, allennlp.models.BasicClassifier):
+            return self.silent_pass
+
+        raise NotImplementedError("The network contains layers that"
+                                  " are currently not supported {0:s}".format(str(layer)))
 
     @staticmethod
     def get_conv_method(conv_module):
@@ -266,12 +277,21 @@ class RelevancePropagator:
 
         """
 
-        conv_func_mapper = {
-            torch.nn.MaxPool1d: F.max_unpool1d,
-            torch.nn.MaxPool2d: F.max_unpool2d,
-            torch.nn.MaxPool3d: F.max_unpool3d
-        }
-        return conv_func_mapper[type(max_pool_instance)]
+        #conv_func_mapper = {
+        #    torch.nn.MaxPool1d: F.max_unpool1d,
+        #    MaxPool1dAll: F.max_unpool1d,
+        #    torch.nn.MaxPool2d: F.max_unpool2d,
+        #    torch.nn.MaxPool3d: F.max_unpool3d
+        #}
+        #return conv_func_mapper[type(max_pool_instance)]
+        if isinstance(max_pool_instance, torch.nn.MaxPool1d):
+            return F.max_unpool1d
+        if isinstance(max_pool_instance, torch.nn.MaxPool2d):
+            return torch.nn.MaxPool2d
+        if isinstance(max_pool_instance, torch.nn.MaxPool3d):
+            return F.max_unpool3d
+        raise NotImplementedError("The network contains MaxPool layers that"
+                                  " are currently not supported {0:s}".format(str(max_pool_instance)))
 
     def time_distributed_inverse(self, m, relevance_in):
         shape_in = list(relevance_in.shape)
@@ -283,6 +303,32 @@ class RelevancePropagator:
     def crf_tagger_inverse(self, m, relevance_in):
         # TODO: implement missing cases (currently we assume that relevance_in is just for logits)
         r = self.get_relevance(f'{m.name_global}.tag_projection_layer', relevance_in['logits'])
+        return r
+
+    def cnn_encoder_inverse(self, m, relevance_in):
+        if m.projection_layer:
+            relevance_in = self.get_relevance(f'{m.name_global}.projection_layer', relevance_in)
+
+        relevance_split = relevance_in.split(m._num_filters, dim=1)
+        rels = []
+        for i, _rel in enumerate(relevance_split):
+            rel_unpooled = self.get_relevance(f'{m.name_global}.maxpool_layer_{i}', _rel)
+            rel_unactivated = self.get_relevance(f'{m.name_global}._activation', rel_unpooled)
+            # DEBUG!
+            rel_unconv = self.get_relevance(f'{m.name_global}.conv_layer_{i}', rel_unactivated)
+            #rel_unconv = self.get_relevance(f'{m.name_global}.conv_layer_0', rel_unactivated)
+            rels.append(rel_unconv)
+
+        rel = sum(rels)
+        rel = torch.transpose(rel, 1, 2)
+        return rel
+
+    def basic_classifier_inverse(self, m, relevance_in):
+        r = self.get_relevance(f'{m.name_global}._classification_layer', relevance_in['logits'])
+        r = self.get_relevance(f'{m.name_global}._seq2vec_encoder', r)
+
+        if m._seq2seq_encoder:
+            r = self.get_relevance(f'{m.name_global}._seq2seq_encoder', r)
         return r
 
     def mask_inverse(self, m, relevance_in):
@@ -433,17 +479,16 @@ class RelevancePropagator:
             setattr(m, "out_shape", out_tensor.shape)
         return
 
-    @module_tracker
-    def time_distributed_fwd_hook(self, m, in_tensor: torch.Tensor, out_tensor: torch.Tensor):
-        #assert isinstance(in_tensor, tuple), f'expected in_tensor to be a tuple, but it is a {type(in_tensor)}'
-        #assert len(in_tensor) == 1, f'expected in_tensor to be a tuple of size 1, but it has size {len(in_tensor)}'
-        #setattr(m, "in_shape", in_tensor[0].shape)
-        return
+    #@module_tracker
+    #def time_distributed_fwd_hook(self, m, in_tensor: torch.Tensor, out_tensor: torch.Tensor):
+    #    #assert isinstance(in_tensor, tuple), f'expected in_tensor to be a tuple, but it is a {type(in_tensor)}'
+    #    #assert len(in_tensor) == 1, f'expected in_tensor to be a tuple of size 1, but it has size {len(in_tensor)}'
+    #    #setattr(m, "in_shape", in_tensor[0].shape)
+    #    return
 
-    @module_tracker
-    def crf_tagger_fwd_hook(self, m, in_tensor: torch.Tensor, out_tensor: torch.Tensor):
-
-        return
+    #@module_tracker
+    #def crf_tagger_fwd_hook(self, m, in_tensor: torch.Tensor, out_tensor: torch.Tensor):
+    #    return
 
     def max_pool_nd_inverse(self, layer_instance, relevance_in):
 
@@ -456,7 +501,7 @@ class RelevancePropagator:
                                layer_instance.kernel_size, layer_instance.stride,
                                layer_instance.padding, output_size=layer_instance.in_shape)
         del layer_instance.indices
-
+        print(f'max_pool_nd_inverse shape: {inverted.size()}')
         return inverted
 
     @module_tracker
@@ -478,7 +523,9 @@ class RelevancePropagator:
 
         # In case the output had been reshaped for a linear layer,
         # make sure the relevance is put into the same shape as before.
-        relevance_in = relevance_in.view(m.out_shape)
+        #relevance_in = relevance_in.view(m.out_shape)
+        if list(m.out_shape) != list(relevance_in.shape):
+            print(f'WARNING: relevance_in.shape ({relevance_in.shape}) is not the same as m.out_shape ({m.out_shape})')
 
         # Get required values from layer
         inv_conv_nd = self.get_inv_conv_method(m)
@@ -612,4 +659,5 @@ class RelevancePropagator:
 
         setattr(m, "in_tensor", in_tensor[0])
         setattr(m, 'out_shape', list(out_tensor.size()))
+        print(f'conv output shape: {m.out_shape}')
         return
