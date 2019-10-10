@@ -29,7 +29,7 @@ class InnvestigateModel(torch.nn.Module):
     """
 
     def __init__(self, the_model, lrp_exponent=1, beta=.5, epsilon=1e-6,
-                 method="e-rule", discard_modules=None):
+                 method="e-rule", discard_modules=None, discard_module_types=None):
         """
         Model wrapper for pytorch models to 'innvestigate' them
         with layer-wise relevance propagation (LRP) as introduced by Bach et. al
@@ -62,6 +62,7 @@ class InnvestigateModel(torch.nn.Module):
         self.r_values_per_layer = None
         self.only_max_score = None
         self.discard_modules = discard_modules or []
+        self.discard_module_types = discard_module_types or ()
         # Initialize the 'Relevance Propagator' with the chosen rule.
         # This will be used to back-propagate the relevance values
         # through the layers in the innvestigate method.
@@ -106,31 +107,16 @@ class InnvestigateModel(torch.nn.Module):
         print(f'add_rlp_forward_hook@{name_prefix} ({fullname(parent_module)})')
         parent_module.register_forward_hook(self.inverter.get_layer_fwd_hook(parent_module))
 
-        if name_prefix == 'model':
-            setattr(parent_module, "name_local", 'model')
-            setattr(parent_module, "name_global", 'model')
-
         if isinstance(parent_module, torch.nn.ReLU):
             parent_module.register_backward_hook(self.relu_hook_function)
 
-        #children_name_global = []
         for name, mod in parent_module.named_children():
             name_w_prefix = f'{name_prefix}.{name}' if name_prefix is not None else name
-            if name_w_prefix in self.discard_modules:
+            if name_w_prefix in self.discard_modules or isinstance(mod, self.discard_module_types):
                 print(f'add_rlp_forward_hook@{name_w_prefix} ({fullname(mod)}): DISCARD')
                 continue
-            #if not isinstance(mod, self.inverter.allowed_pass_layers):
-            #    children_name_global.append(name_w_prefix)
-            setattr(mod, "name_local", name)
-            setattr(mod, "name_global", name_w_prefix)
-            try:
-                parent_name = parent_module.name_global
-                setattr(mod, "name_parent", parent_name)
-            except AttributeError:
-                pass
             self.register_hooks(mod, name_prefix=name_w_prefix)
 
-        #setattr(parent_module, "name_children", children_name_global)
 
     @staticmethod
     def relu_hook_function(module, grad_in, grad_out):
@@ -239,9 +225,8 @@ class InnvestigateModel(torch.nn.Module):
 
                 relevance = relevance_tensor.detach()
                 del relevance_tensor
-            # reset list to save relevance distributions per layer
-            self.inverter.reset_relevances()
-            r = self.inverter.get_relevance(module_name='model', relevance_in=relevance)
+
+            r = self.inverter.compute_propagated_relevance(layer=self.model, relevance_in=relevance)
 
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()

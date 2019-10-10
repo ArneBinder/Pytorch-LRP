@@ -27,7 +27,7 @@ def module_tracker(fwd_hook_func):
     """
     def hook_wrapper(relevance_propagator_instance, layer, *args):
         #relevance_propagator_instance.module_list.append(layer)
-        relevance_propagator_instance.module_dict[layer.name_global] = layer
+        #relevance_propagator_instance.module_dict[layer.name_global] = layer
         return fwd_hook_func(relevance_propagator_instance, layer, *args)
 
     return hook_wrapper
@@ -64,8 +64,6 @@ class RelevancePropagator:
         self.beta = beta
         self.eps = epsilon
         self.warned_log_softmax = False
-        self.module_dict = {}
-        self.relevances = {}
         if method not in self.available_methods:
             raise NotImplementedError("Only methods available are: " +
                                       str(self.available_methods))
@@ -81,22 +79,11 @@ class RelevancePropagator:
 
         """
         #self.module_list = []
-        self.module_dict = {}
+        #self.module_dict = {}
         # Try to free memory
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
 
-    def get_relevance(self, module_name, relevance_in):
-        if module_name not in self.relevances:
-            m = self.module_dict[module_name]
-            self.relevances[module_name] = self.compute_propagated_relevance(layer=m, relevance_in=relevance_in)
-        return self.relevances[module_name]
-
-    def set_relevances(self, init_dict):
-        self.relevances = init_dict
-
-    def reset_relevances(self):
-        self.relevances = {}
 
     def compute_propagated_relevance(self, layer, relevance_in):
         """
@@ -296,27 +283,29 @@ class RelevancePropagator:
     def time_distributed_inverse(self, m, relevance_in):
         shape_in = list(relevance_in.shape)
         relevance_in_reshaped = relevance_in.reshape([shape_in[0] * shape_in[1]] + shape_in[2:])
-        r = self.get_relevance(f'{m.name_global}._module', relevance_in_reshaped)
+        r = self.compute_propagated_relevance(layer=m._module, relevance_in=relevance_in_reshaped)
         shape_out = [shape_in[0], shape_in[1]] + list(r.shape)[1:]
         return r.reshape(shape_out)
 
     def crf_tagger_inverse(self, m, relevance_in):
-        # TODO: implement missing cases (currently we assume that relevance_in is just for logits)
-        r = self.get_relevance(f'{m.name_global}.tag_projection_layer', relevance_in['logits'])
+        r = self.compute_propagated_relevance(layer=m.tag_projection_layer, relevance_in=relevance_in['logits'])
+        if m._feedforward is not None:
+            r = self.compute_propagated_relevance(layer=m._feedforward, relevance_in=r)
+
+        r = self.compute_propagated_relevance(layer=m.encoder, relevance_in=r)
+
         return r
 
     def cnn_encoder_inverse(self, m, relevance_in):
         if m.projection_layer:
-            relevance_in = self.get_relevance(f'{m.name_global}.projection_layer', relevance_in)
+            relevance_in = self.compute_propagated_relevance(layer=m.projection_layer, relevance_in=relevance_in)
 
         relevance_split = relevance_in.split(m._num_filters, dim=1)
         rels = []
         for i, _rel in enumerate(relevance_split):
-            rel_unpooled = self.get_relevance(f'{m.name_global}.maxpool_layer_{i}', _rel)
-            rel_unactivated = self.get_relevance(f'{m.name_global}._activation', rel_unpooled)
-            # DEBUG!
-            rel_unconv = self.get_relevance(f'{m.name_global}.conv_layer_{i}', rel_unactivated)
-            #rel_unconv = self.get_relevance(f'{m.name_global}.conv_layer_0', rel_unactivated)
+            rel_unpooled = self.compute_propagated_relevance(layer=getattr(m, f'maxpool_layer_{i}'), relevance_in=_rel)
+            rel_unactivated = self.compute_propagated_relevance(layer=m._activation, relevance_in=rel_unpooled)
+            rel_unconv = self.compute_propagated_relevance(layer=getattr(m, f'conv_layer_{i}'), relevance_in=rel_unactivated)
             rels.append(rel_unconv)
 
         rel = sum(rels)
@@ -324,11 +313,11 @@ class RelevancePropagator:
         return rel
 
     def basic_classifier_inverse(self, m, relevance_in):
-        r = self.get_relevance(f'{m.name_global}._classification_layer', relevance_in['logits'])
-        r = self.get_relevance(f'{m.name_global}._seq2vec_encoder', r)
+        r = self.compute_propagated_relevance(layer=m._classification_layer, relevance_in=relevance_in['logits'])
+        r = self.compute_propagated_relevance(layer=m._seq2vec_encoder, relevance_in=r)
 
         if m._seq2seq_encoder:
-            r = self.get_relevance(f'{m.name_global}._seq2seq_encoder', r)
+            r = self.compute_propagated_relevance(layer=m._seq2seq_encoder, relevance_in=r)
         return r
 
     def mask_inverse(self, m, relevance_in):
@@ -501,7 +490,6 @@ class RelevancePropagator:
                                layer_instance.kernel_size, layer_instance.stride,
                                layer_instance.padding, output_size=layer_instance.in_shape)
         del layer_instance.indices
-        print(f'max_pool_nd_inverse shape: {inverted.size()}')
         return inverted
 
     @module_tracker
@@ -659,5 +647,4 @@ class RelevancePropagator:
 
         setattr(m, "in_tensor", in_tensor[0])
         setattr(m, 'out_shape', list(out_tensor.size()))
-        print(f'conv output shape: {m.out_shape}')
         return
