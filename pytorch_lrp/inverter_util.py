@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import allennlp
 
 from pytorch_lrp.explainable_modules.cnn_encoder import ExplainableCnnEncoder, MaxPool1dAll
+from aprobe.nn.senteval import PassThroughSeq2VecEncoder
 
 
 class Flatten(torch.nn.Module):
@@ -52,7 +53,8 @@ class RelevancePropagator:
                            torch.nn.Softmax,
                            torch.nn.LogSoftmax,
                            torch.nn.Sigmoid,
-                           allennlp.modules.seq2seq_encoders.PassThroughEncoder)
+                           allennlp.modules.seq2seq_encoders.PassThroughEncoder,
+                           PassThroughSeq2VecEncoder)
     # Implemented rules for relevance propagation.
     available_methods = ["e-rule", "b-rule"]
 
@@ -130,6 +132,8 @@ class RelevancePropagator:
 
         elif isinstance(layer, torch.nn.Linear):
             return self.linear_inverse(layer, relevance_in).detach()
+        elif isinstance(layer, allennlp.modules.FeedForward):
+            return self.feedforward_inverse(layer, relevance_in).detach()
         #elif isinstance(layer, allennlp.modules.seq2seq_encoders.PassThroughEncoder):
         #    return self.mask_inverse(layer, relevance_in).detach()
         elif isinstance(layer, allennlp.modules.TimeDistributed):
@@ -177,7 +181,13 @@ class RelevancePropagator:
         #if isinstance(layer, allennlp.modules.seq2seq_encoders.PassThroughEncoder):
         #    return self.mask_fwd_hook
 
+        if isinstance(layer, torch.nn.ModuleList):
+            return self.silent_pass
+
         if isinstance(layer, allennlp.modules.TimeDistributed):
+            return self.silent_pass
+
+        if isinstance(layer, allennlp.modules.FeedForward):
             return self.silent_pass
 
         if isinstance(layer, allennlp.models.crf_tagger.CrfTagger):
@@ -314,11 +324,21 @@ class RelevancePropagator:
 
     def basic_classifier_inverse(self, m, relevance_in):
         r = self.compute_propagated_relevance(layer=m._classification_layer, relevance_in=relevance_in['logits'])
+        if hasattr(m, '_feedforward'):
+            r = self.compute_propagated_relevance(layer=m._feedforward, relevance_in=r)
         r = self.compute_propagated_relevance(layer=m._seq2vec_encoder, relevance_in=r)
 
         if m._seq2seq_encoder:
             r = self.compute_propagated_relevance(layer=m._seq2seq_encoder, relevance_in=r)
         return r
+
+    def feedforward_inverse(self, m, relevance_in):
+        for layer, activation, dropout in list(zip(m._linear_layers, m._activations, m._dropout))[::-1]:
+            # forward: output = dropout(activation(layer(output)))
+            relevance_in = self.compute_propagated_relevance(layer=dropout, relevance_in=relevance_in)
+            relevance_in = self.compute_propagated_relevance(layer=activation, relevance_in=relevance_in)
+            relevance_in = self.compute_propagated_relevance(layer=layer, relevance_in=relevance_in)
+        return relevance_in
 
     def mask_inverse(self, m, relevance_in):
         try:
