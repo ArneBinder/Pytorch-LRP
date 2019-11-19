@@ -1,4 +1,5 @@
-import allennlp
+from typing import Callable
+
 import torch
 
 from pytorch_lrp.inverter_util import RelevancePropagator
@@ -29,7 +30,8 @@ class InnvestigateModel(torch.nn.Module):
     """
 
     def __init__(self, the_model, lrp_exponent=1, beta=.5, epsilon=1e-6,
-                 method="e-rule", discard_modules=None, discard_module_types=None):
+                 method="e-rule", discard_modules=None, discard_module_types=None,
+                 additional_allowed_pass_layers=(), additional_no_forward_hook_layers=()):
         """
         Model wrapper for pytorch models to 'innvestigate' them
         with layer-wise relevance propagation (LRP) as introduced by Bach et. al
@@ -68,7 +70,9 @@ class InnvestigateModel(torch.nn.Module):
         # through the layers in the innvestigate method.
         self.inverter = RelevancePropagator(lrp_exponent=lrp_exponent,
                                             beta=beta, method=method, epsilon=epsilon,
-                                            device=self.device)
+                                            device=self.device,
+                                            additional_allowed_pass_layers=additional_allowed_pass_layers,
+                                            additional_no_forward_hook_layers=additional_no_forward_hook_layers)
 
         # Parsing the individual model layers
         self.register_hooks(self.model)
@@ -92,31 +96,57 @@ class InnvestigateModel(torch.nn.Module):
         self.inverter.device = self.device
         return super(InnvestigateModel, self).cpu()
 
-    def register_hooks(self, parent_module, name_prefix='model'):
+    def get_lrp_backward(self, module: torch.nn.Module):
+        return self.inverter.get_backward_function(module)
+
+    def register_lrp_backward(self, module: torch.nn.Module,
+                              lrp_backward: Callable[[RelevancePropagator, torch.nn.Module, torch.FloatTensor],
+                                                     torch.FloatTensor]):
+        """
+        Register a lrp backward function at a module. Afterwards, it is callable as:
+            module.lrp_backward(relevance_in)
+
+        :param module: the module to register the lrp_backward function
+        :param lrp_backward: the lrp_backward function
+        :return: None
+        """
+
+        def _lrp_backward(relevance_in: torch.FloatTensor):
+            return lrp_backward(self.inverter, module, relevance_in)
+
+        setattr(module, 'lrp_backward', _lrp_backward)
+
+    def register_hooks(self, module: torch.nn.Module, name_prefix: str = 'model'):
         """
         Recursively unrolls a model and registers the required
         hooks to save all the necessary values for LRP in the forward pass.
 
         Args:
-            parent_module: Model to unroll and register hooks for.
+            module: Model to unroll and register hooks and lrp_backward function for.
+            name_prefix: to construct full name for child modules that may be used to discard modules
 
         Returns:
             None
 
         """
-        print(f'add_rlp_forward_hook@{name_prefix} ({fullname(parent_module)})')
-        parent_module.register_forward_hook(self.inverter.get_layer_fwd_hook(parent_module))
+        print(f'add_rlp_forward_hook@{name_prefix} ({fullname(module)})')
+        if not hasattr(module, 'lrp_forward_hook'):
+            setattr(module, 'lrp_forward_hook', self.inverter.get_layer_fwd_hook(module))
 
-        if isinstance(parent_module, torch.nn.ReLU):
-            parent_module.register_backward_hook(self.relu_hook_function)
+        module.register_forward_hook(module.lrp_forward_hook)
 
-        for name, mod in parent_module.named_children():
+        if not hasattr(module, 'lrp_backward'):
+            self.register_lrp_backward(module, lrp_backward=self.get_lrp_backward(module))
+
+        if isinstance(module, torch.nn.ReLU):
+            module.register_backward_hook(self.relu_hook_function)
+
+        for name, mod in module.named_children():
             name_w_prefix = f'{name_prefix}.{name}' if name_prefix is not None else name
             if name_w_prefix in self.discard_modules or isinstance(mod, self.discard_module_types):
                 print(f'add_rlp_forward_hook@{name_w_prefix} ({fullname(mod)}): DISCARD')
                 continue
             self.register_hooks(mod, name_prefix=name_w_prefix)
-
 
     @staticmethod
     def relu_hook_function(module, grad_in, grad_out):
@@ -152,15 +182,10 @@ class InnvestigateModel(torch.nn.Module):
         """
         # Reset module list. In case the structure changes dynamically,
         # the module list is tracked for every forward pass.
-        self.inverter.reset_module_list()
+        #self.inverter.reset_module_list()
+        torch.cuda.empty_cache()
         self.prediction = self.model(*args, **kwargs)
         return self.prediction
-
-    def get_r_values_per_layer(self):
-        if self.r_values_per_layer is None:
-            print("No relevances have been calculated yet, returning None in"
-                   " get_r_values_per_layer.")
-        return self.r_values_per_layer
 
     def innvestigate(self, in_tensor=None, prediction=None, relevance=None, rel_for_class=None):
         """
@@ -226,7 +251,7 @@ class InnvestigateModel(torch.nn.Module):
                 relevance = relevance_tensor.detach()
                 del relevance_tensor
 
-            r = self.inverter.compute_propagated_relevance(layer=self.model, relevance_in=relevance)
+            r = self.model.lrp_backward(relevance)
 
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
