@@ -2,9 +2,10 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 import allennlp
+from allennlp import models
 
 from pytorch_lrp.explainable_modules.cnn_encoder import ExplainableCnnEncoder, MaxPool1dAll
-from aprobe.nn.senteval import PassThroughSeq2VecEncoder
+#from aprobe.nn.senteval import PassThroughSeq2VecEncoder
 
 
 class Flatten(torch.nn.Module):
@@ -53,8 +54,8 @@ class RelevancePropagator:
                            torch.nn.Softmax,
                            torch.nn.LogSoftmax,
                            torch.nn.Sigmoid,
-                           allennlp.modules.seq2seq_encoders.PassThroughEncoder,
-                           PassThroughSeq2VecEncoder)
+                           allennlp.modules.seq2seq_encoders.PassThroughEncoder)#,
+                           #PassThroughSeq2VecEncoder)
     # Implemented rules for relevance propagation.
     available_methods = ["e-rule", "b-rule"]
 
@@ -138,12 +139,14 @@ class RelevancePropagator:
         #    return self.mask_inverse(layer, relevance_in).detach()
         elif isinstance(layer, allennlp.modules.TimeDistributed):
             return self.time_distributed_inverse(layer, relevance_in).detach()
-        elif isinstance(layer, allennlp.models.crf_tagger.CrfTagger):
+        elif isinstance(layer, models.crf_tagger.CrfTagger):
             return self.crf_tagger_inverse(layer, relevance_in).detach()
         elif isinstance(layer, ExplainableCnnEncoder):
             return self.cnn_encoder_inverse(layer, relevance_in).detach()
-        elif isinstance(layer, allennlp.models.BasicClassifier):
+        elif isinstance(layer, models.BasicClassifier):
             return self.basic_classifier_inverse(layer, relevance_in).detach()
+        elif isinstance(layer, torch.nn.Sequential):
+            return self.sequential_inverse(layer, relevance_in).detach()
         else:
             raise NotImplementedError("The network contains layers that"        
                                       " are currently not supported {0:s}".format(str(layer)))
@@ -190,13 +193,16 @@ class RelevancePropagator:
         if isinstance(layer, allennlp.modules.FeedForward):
             return self.silent_pass
 
-        if isinstance(layer, allennlp.models.crf_tagger.CrfTagger):
+        if isinstance(layer, models.crf_tagger.CrfTagger):
             return self.silent_pass
 
         if isinstance(layer, ExplainableCnnEncoder):
             return self.silent_pass
 
-        if isinstance(layer, allennlp.models.BasicClassifier):
+        if isinstance(layer, models.BasicClassifier):
+            return self.silent_pass
+
+        if isinstance(layer, torch.nn.Sequential):
             return self.silent_pass
 
         raise NotImplementedError("The network contains layers that"
@@ -330,6 +336,13 @@ class RelevancePropagator:
 
         if m._seq2seq_encoder:
             r = self.compute_propagated_relevance(layer=m._seq2seq_encoder, relevance_in=r)
+        return r
+
+    def sequential_inverse(self, m, relevance_in):
+        r = relevance_in
+
+        for l in m[::-1]:
+            r = self.compute_propagated_relevance(layer=l, relevance_in=r)
         return r
 
     def feedforward_inverse(self, m, relevance_in):
