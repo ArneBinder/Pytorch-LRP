@@ -9,6 +9,11 @@ setup(name='PytorchLRP',
       #author_email='arne.b.binder@gmail.com',
       url='https://github.com/moboehle/Pytorch-LRP',
       packages=find_packages(),
+      install_requires=[
+            'allennlp',
+            'torch',
+            'numpy'
+      ],
       #packages=['pytorch_lrp']
       #py_modules=['innvestigator', 'inverter_util', 'utils']
      )
