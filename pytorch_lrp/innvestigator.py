@@ -2,7 +2,7 @@ from typing import Callable
 
 import torch
 
-from pytorch_lrp.inverter_util import RelevancePropagator
+from pytorch_lrp.inverter_util import RelevancePropagator, silent_pass, pass_inverted
 
 
 def fullname(o):
@@ -129,14 +129,20 @@ class InnvestigateModel(torch.nn.Module):
             None
 
         """
-        print(f'add_rlp_forward_hook@{name_prefix} ({fullname(module)})')
+
         if not hasattr(module, 'lrp_forward_hook'):
-            setattr(module, 'lrp_forward_hook', self.inverter.get_layer_fwd_hook(module))
+            fwd_hook_func = self.inverter.get_layer_fwd_hook(module)
+            if fwd_hook_func != silent_pass:
+                print(f'{name_prefix} ({fullname(module)}): add rlp_forward_hook')
+            setattr(module, 'lrp_forward_hook', fwd_hook_func)
 
         module.register_forward_hook(module.lrp_forward_hook)
 
         if not hasattr(module, 'lrp_backward'):
-            self.register_lrp_backward(module, lrp_backward=self.get_lrp_backward(module))
+            lrp_backward_func = self.get_lrp_backward(module)
+            if lrp_backward_func != pass_inverted:
+                print(f'{name_prefix} ({fullname(module)}): add rlp_backward')
+            self.register_lrp_backward(module, lrp_backward=lrp_backward_func)
 
         if isinstance(module, torch.nn.ReLU):
             module.register_backward_hook(self.relu_hook_function)
